@@ -1,32 +1,22 @@
-pipeline {
-    agent any   // the agent must have docker, git and unzip; use agent { label 'docker' } if you have labelled nodes
+// Scripted pipeline: builds sunbird-rc-core from BRANCH and pushes IMAGE_REPO:<branch>_<commit>
+// Job parameters BRANCH and IMAGE_REPO are defined in the job configuration.
+// The agent must have docker, git and unzip; use node('docker') if you have labelled nodes.
 
-    options {
-        disableConcurrentBuilds()          // build dirs below are shared, so one build at a time
-        timeout(time: 60, unit: 'MINUTES')
-        buildDiscarder(logRotator(numToKeepStr: '20'))
-    }
+node {
+    timeout(time: 60, unit: 'MINUTES') {
+        withEnv([
+            'BUILD_DIR=/var/tmp/rc-build',
+            'IMAGE_DIR=/var/tmp/rc-image',
+            'M2_DIR=/var/tmp/m2-rc',
+            'MIN_FREE_GB=10'
+        ]) {
 
-    parameters {
-        string(name: 'BRANCH',     defaultValue: 'schema-load-fix', description: 'Git branch to build')
-        string(name: 'REPO_URL',   defaultValue: 'https://github.com/Sphere/sunbird-rc-core.git', description: 'Git repository')
-        string(name: 'TAG_PREFIX', defaultValue: '0.0.13.1-work', description: 'Image tag prefix; the short commit hash is appended')
-        string(name: 'IMAGE_REPO', defaultValue: 'aastardev1/sunbird-rc-core', description: 'Docker Hub repository')
-        booleanParam(name: 'PUSH', defaultValue: true, description: 'Push the image to Docker Hub')
-    }
-
-    environment {
-        BUILD_DIR    = '/var/tmp/rc-build'
-        IMAGE_DIR    = '/var/tmp/rc-image'
-        M2_DIR       = '/var/tmp/m2-rc'
-        MIN_FREE_GB  = '10'
-    }
-
-    stages {
-        stage('Checkout') {
-            steps {
+            stage('Checkout') {
+                // Repository URL comes from the job's "Pipeline script from SCM" configuration
+                env.REPO_URL = scm.userRemoteConfigs[0].url
                 sh '''
                     set -eu
+                    echo "Repo: $REPO_URL  Branch: $BRANCH"
                     rm -rf "$BUILD_DIR"
                     git clone -b "$BRANCH" --depth 1 "$REPO_URL" "$BUILD_DIR"
                     git -C "$BUILD_DIR" log -1 --oneline
@@ -36,11 +26,8 @@ pipeline {
                        "$BUILD_DIR/java/claim/src/main/resources/application.properties"
                 '''
             }
-        }
 
-
-        stage('Maven build (Java 8)') {
-            steps {
+            stage('Maven build (Java 8)') {
                 sh '''
                     set -eu
                     mkdir -p "$M2_DIR"
@@ -56,15 +43,14 @@ pipeline {
                     ls -la "$BUILD_DIR/java/registry/target/registry.jar"
                 '''
             }
-        }
 
-        stage('Docker build') {
-            steps {
-                script {
-                    def shortSha = sh(returnStdout: true, script: 'git -C "$BUILD_DIR" rev-parse --short HEAD').trim()
-                    env.IMAGE_TAG = "${params.TAG_PREFIX}_${shortSha}"
-                    currentBuild.displayName = "#${env.BUILD_NUMBER} ${params.BRANCH} ${env.IMAGE_TAG}"
-                }
+            stage('Docker build') {
+                def shortSha = sh(returnStdout: true, script: 'git -C "$BUILD_DIR" rev-parse --short HEAD').trim()
+                // Docker tags allow only letters, digits, '_', '.', '-' (e.g. feature/x -> feature-x)
+                def safeBranch = params.BRANCH.replaceAll('[^A-Za-z0-9_.-]', '-').replaceAll('^[.-]+', '')
+                env.IMAGE_TAG = "${safeBranch}_${shortSha}"
+                currentBuild.displayName = "#${env.BUILD_NUMBER} ${env.IMAGE_TAG}"
+
                 sh '''
                     set -eu
                     rm -rf "$IMAGE_DIR" && mkdir -p "$IMAGE_DIR" && cd "$IMAGE_DIR"
@@ -74,17 +60,12 @@ pipeline {
                     docker build -t "$IMAGE_REPO:$IMAGE_TAG" .
                 '''
             }
-        }
 
-        stage('Docker push') {
-            when { expression { params.PUSH } }
-            steps {
+            stage('Docker push') {
                 sh 'docker push "$IMAGE_REPO:$IMAGE_TAG"'
             }
-        }
-    }
 
-    post {
-        success { echo "Built ${params.IMAGE_REPO}:${env.IMAGE_TAG} from ${params.BRANCH}" }
+            echo "Built ${params.IMAGE_REPO}:${env.IMAGE_TAG} from ${env.REPO_URL} (${params.BRANCH})"
+        }
     }
 }
